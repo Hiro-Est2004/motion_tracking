@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>coexistence</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+canvas { display: block; width: 100vw; height: 100vh; }
+#msg {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  color: rgba(255,255,255,0.3);
+  font-size: 12px;
+  font-family: monospace;
+  text-align: center;
+  line-height: 2.2;
+  pointer-events: none;
+  transition: opacity 1.5s;
+}
+</style>
+</head>
+<body>
+<video id="v" autoplay playsinline muted style="display:none;"></video>
+<canvas id="c"></canvas>
+<div id="msg">読み込み中...</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+
+<script>
+const video  = document.getElementById('v');
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const msg    = document.getElementById('msg');
+
+let W = canvas.width  = window.innerWidth;
+let H = canvas.height = window.innerHeight;
+
+window.addEventListener('resize', () => {
+  W = canvas.width  = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+});
+
+// ランドマーク保持
+let posePts  = [];
+let handPts  = [];
+let facePts  = [];
+
+// FaceMesh: 口周り・目・眉のみ使用（間引いて密度を調整）
+// 口: 61,185,40,39,37,0,267,269,270,409,291,375,321,405,314,17,84,181,91,146
+// 左目: 33,7,163,144,145,153,154,155,133,246
+// 右目: 263,249,390,373,374,380,381,382,362,466
+// 鼻: 1,2,5,4,195,197
+const FACE_INDICES = [
+  61,185,40,39,37,0,267,269,270,409,291,375,321,405,314,17,84,181,91,146,
+  33,7,163,144,145,153,154,155,133,
+  263,249,390,373,374,380,381,382,362,
+  1,2,5,4,168,
+  70,63,105,66,107,
+  336,296,334,293,300,
+];
+
+// Pose: 顔・体のランドマークindex（顔は除外、体だけ使う）
+// 11=左肩 12=右肩 13=左肘 14=右肘 15=左手首 16=右手首
+// 23=左腰 24=右腰 25=左膝 26=右膝 27=左足首 28=右足首
+// 0=鼻 7=左耳 8=右耳
+const POSE_INDICES = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32];
+
+// Poseのスケルトン接続
+const POSE_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[9,10],
+  [11,12],[11,13],[13,15],[12,14],[14,16],
+  [15,17],[15,19],[15,21],[17,19],
+  [16,18],[16,20],[16,22],[18,20],
+  [11,23],[12,24],[23,24],
+  [23,25],[25,27],[24,26],[26,28],
+  [27,29],[29,31],[27,31],[28,30],[30,32],[28,32],
+];
+
+const CONNECT_DIST = 100;
+
+function lmToScreen(lm) {
+  return { x: (1 - lm.x) * W, y: lm.y * H, vis: lm.visibility ?? 1 };
+}
+
+function onPoseResults(results) {
+  posePts = [];
+  if (!results.poseLandmarks) return;
+  for (const idx of POSE_INDICES) {
+    const lm = results.poseLandmarks[idx];
+    if (lm && (lm.visibility ?? 1) > 0.3) {
+      posePts.push({ ...lmToScreen(lm), idx });
+    }
+  }
+}
+
+function onHandResults(results) {
+  handPts = [];
+  if (!results.multiHandLandmarks) return;
+  for (const lms of results.multiHandLandmarks) {
+    for (const lm of lms) {
+      handPts.push(lmToScreen(lm));
+    }
+  }
+}
+
+function onFaceResults(results) {
+  facePts = [];
+  if (!results.multiFaceLandmarks) return;
+  for (const lms of results.multiFaceLandmarks) {
+    for (const idx of FACE_INDICES) {
+      const lm = lms[idx];
+      if (lm) facePts.push({ x: (1 - lm.x) * W, y: lm.y * H });
+    }
+  }
+}
+
+let tick = 0;
+
+function draw() {
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.fillRect(0, 0, W, H);
+
+  const allPts = [...posePts, ...handPts, ...facePts];
+
+  if (allPts.length === 0) {
+    tick++;
+    requestAnimationFrame(draw);
+    return;
+  }
+
+  // 1. Poseのスケルトン線（骨格に沿った固定接続）
+  const poseMap = {};
+  for (const p of posePts) poseMap[p.idx] = p;
+  for (const [a, b] of POSE_CONNECTIONS) {
+    if (!poseMap[a] || !poseMap[b]) continue;
+    const pa = poseMap[a], pb = poseMap[b];
+    const hue = 210 + Math.sin(tick * 0.008) * 20;
+    ctx.beginPath();
+    ctx.moveTo(pa.x, pa.y);
+    ctx.lineTo(pb.x, pb.y);
+    ctx.strokeStyle = `hsla(${hue}, 50%, 60%, 0.35)`;
+    ctx.lineWidth = 0.8;
+    ctx.stroke();
+  }
+
+  // 2. 全点間の距離ベースネットワーク（手と体をつなぐ）
+  for (let a = 0; a < allPts.length; a++) {
+    for (let b = a + 1; b < allPts.length; b++) {
+      const pa = allPts[a], pb = allPts[b];
+      const dx = pa.x - pb.x, dy = pa.y - pb.y;
+      const dist = Math.sqrt(dx*dx + dy*dy);
+      if (dist < CONNECT_DIST) {
+        const t = 1 - dist / CONNECT_DIST;
+        const hue = 200 + Math.sin(tick * 0.01 + a * 0.4) * 35;
+        ctx.beginPath();
+        ctx.moveTo(pa.x, pa.y);
+        ctx.lineTo(pb.x, pb.y);
+        ctx.strokeStyle = `hsla(${hue}, 65%, 72%, ${t * 0.55})`;
+        ctx.lineWidth = t * 1.0;
+        ctx.stroke();
+      }
+    }
+  }
+
+  // 3. ノード描画
+  for (let i = 0; i < allPts.length; i++) {
+    const p = allPts[i];
+    const isHand = i >= posePts.length && i < posePts.length + handPts.length;
+    const isFace = i >= posePts.length + handPts.length;
+    const hue = isHand ? 200 + Math.sin(tick*0.015+i*0.6)*30
+              : isFace ? 230 + Math.sin(tick*0.012+i*0.5)*20
+              : 220 + Math.sin(tick*0.01+i*0.4)*20;
+    const pulse = 0.75 + 0.25 * Math.sin(tick * 0.05 + i * 0.9);
+    const size  = isHand ? 1.8*pulse : isFace ? 1.2*pulse : 3.0*pulse;
+    const alpha = isHand ? 0.85 : isFace ? 0.7 : 0.75;
+
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, size, 0, Math.PI * 2);
+    ctx.fillStyle = `hsla(${hue}, 55%, 80%, ${alpha})`;
+    ctx.fill();
+  }
+
+  tick++;
+  requestAnimationFrame(draw);
+}
+
+async function startCamera() {
+  msg.textContent = '読み込み中...';
+  try {
+    // Pose初期化
+    const pose = new Pose({locateFile: f =>
+      `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}`
+    });
+    pose.setOptions({
+      modelComplexity: 1,
+      smoothLandmarks: true,
+      enableSegmentation: false,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+    pose.onResults(onPoseResults);
+
+    // Hands初期化
+    const hands = new Hands({locateFile: f =>
+      `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+    });
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.5,
+    });
+    hands.onResults(onHandResults);
+
+    // FaceMesh初期化
+    const faceMesh = new FaceMesh({locateFile: f =>
+      `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`
+    });
+    faceMesh.setOptions({
+      maxNumFaces: 1,
+      refineLandmarks: true,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+    faceMesh.onResults(onFaceResults);
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: 640, height: 480 }
+    });
+    video.srcObject = stream;
+    await new Promise(r => { video.onloadedmetadata = r; });
+    video.play();
+    msg.style.opacity = '0';
+    setTimeout(() => { msg.style.display = 'none'; }, 1500);
+
+    // 3つを順番に送る
+    let frameCount = 0;
+    const camera = new Camera(video, {
+      onFrame: async () => {
+        const m = frameCount % 3;
+        if (m === 0) await pose.send({ image: video });
+        else if (m === 1) await hands.send({ image: video });
+        else await faceMesh.send({ image: video });
+        frameCount++;
+      },
+      width: 640, height: 480,
+    });
+    camera.start();
+  } catch(e) {
+    console.error(e);
+    msg.innerHTML = 'カメラを許可してください<br><span style="font-size:11px;opacity:0.5;">localhost経由で開いてますか？</span>';
+  }
+}
+
+startCamera();
+draw();
+</script>
+</body>
+</html>
