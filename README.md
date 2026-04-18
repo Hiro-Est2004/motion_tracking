@@ -1,7 +1,6 @@
 # motion_tracking
 
 MediaPipeで体・手・顔をリアルタイム検出し、ランドマーク間を結んだネットワークとして可視化します。  
-改善の余地しかないmotion_trackingです。
 
 ## デモ
 
